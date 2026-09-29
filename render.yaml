@@ -1,0 +1,18 @@
+# Render Blueprint for the phone-agent webhook backend.
+services:
+  - type: web
+    name: jeeves-phone-agent
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: ELEVENLABS_API_KEY
+        sync: false
+      - key: OUTBOUND_AGENT_ID
+        sync: false
+      - key: PHONE_NUMBER_ID
+        sync: false
+      - key: AARON_CALLER_NUMBER
+        value: "+17016091267"
