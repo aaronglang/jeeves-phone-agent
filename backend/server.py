@@ -4,17 +4,21 @@ inbound agent to Aaron's personal assistant via a polled inbox.
 
 Endpoints:
   POST /tools/request-call   <- ElevenLabs webhook tool (inbound agent).
-                               caller_number is REQUIRED and must match
-                               AARON_CALLER_NUMBER.
+                               caller_number is REQUIRED and must be Aaron
+                               (principal) or Rosalie (near-principal).
   POST /tools/relay-task     <- ElevenLabs webhook tool: hand a non-call
-                               task to the assistant. Same caller check.
+                               task to the assistant. Open to ANY caller;
+                               caller type is recorded, not enforced.
+                               Optional conversation_id is stored and
+                               prefixed onto the task as [conv:<id>].
   GET  /health               <- public liveness check (keep-warm pings this)
   GET  /tasks                <- recent task log (bearer token required)
   GET  /inbox                <- unacknowledged relayed tasks (bearer token)
   POST /inbox/ack            <- acknowledge a relayed task (bearer token)
 
 Env: ELEVENLABS_API_KEY, OUTBOUND_AGENT_ID, PHONE_NUMBER_ID,
-     AARON_CALLER_NUMBER (required for authorization),
+     AARON_CALLER_NUMBER (default +17016091267),
+     ROSALIE_CALLER_NUMBER (default +14805935327),
      INBOX_TOKEN (bearer token for /tasks, /inbox, /inbox/ack), PORT
 
 Note: Render's filesystem is ephemeral, so the inbox is best-effort
@@ -45,7 +49,8 @@ app = Flask(__name__)
 EL_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
 OUTBOUND_AGENT_ID = os.environ.get("OUTBOUND_AGENT_ID", "")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "")
-AARON_CALLER_NUMBER = os.environ.get("AARON_CALLER_NUMBER", "")
+AARON_CALLER_NUMBER = os.environ.get("AARON_CALLER_NUMBER") or "+17016091267"
+ROSALIE_CALLER_NUMBER = os.environ.get("ROSALIE_CALLER_NUMBER") or "+14805935327"
 INBOX_TOKEN = os.environ.get("INBOX_TOKEN", "")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TASK_LOG = os.path.join(BASE_DIR, "tasks.jsonl")
@@ -91,15 +96,22 @@ def save_inbox(items):
 inbox_items = load_inbox()
 
 
+def caller_type(number):
+    """Classify a phone number as aaron / rosalie / third_party."""
+    if number and number == AARON_CALLER_NUMBER:
+        return "aaron"
+    if number and number == ROSALIE_CALLER_NUMBER:
+        return "rosalie"
+    return "third_party"
+
+
 def check_caller(caller):
-    """Fail-closed caller authorization. Returns an error response or None."""
-    if not AARON_CALLER_NUMBER:
-        log.error("refused: AARON_CALLER_NUMBER not configured")
-        return jsonify(ok=False, error="server not configured"), 500
+    """Fail-closed authorization for principals (Aaron, Rosalie).
+    Returns an error response or None."""
     if not caller:
         return jsonify(ok=False, error="caller_number is required"), 400
-    if caller != AARON_CALLER_NUMBER:
-        log.warning("Rejected: caller mismatch")
+    if caller_type(caller) == "third_party":
+        log.warning("Rejected: caller not authorized")
         return jsonify(ok=False, error="caller not authorized"), 403
     return None
 
@@ -114,22 +126,53 @@ def require_bearer():
     return None
 
 
+REQUIRED_CALL_VARS = ("callback_topic", "callback_summary",
+                      "callee_type", "callee_name")
+
+
+def call_variables(to_number, task_brief, contact_name):
+    """Build the dynamic variables every outbound call must carry."""
+    callee = caller_type(to_number)
+    default_name = {"aaron": "Aaron", "rosalie": "Rosalie"}.get(callee, "there")
+    first_line = task_brief.strip().split(".")[0][:160]
+    return {
+        "task_brief": task_brief,
+        "callback_topic": first_line or contact_name or "a matter for Aaron",
+        "callback_summary": task_brief or first_line or "No summary provided.",
+        "callee_type": callee,
+        "callee_name": contact_name or default_name,
+    }
+
+
+def opener(variables):
+    """Jeeves identifies as Aaron's butler on every call."""
+    if variables["callee_type"] == "aaron":
+        return f"Jeeves here, Aaron. {variables['callback_topic']}."
+    if variables["callee_type"] == "rosalie":
+        return f"Jeeves here, Rosalie. {variables['callback_topic']}."
+    return (f"I'm Jeeves — Aaron's butler. "
+            f"I'm calling regarding {variables['callback_topic']}.")
+
+
 def elevenlabs_outbound(to_number, task_brief, contact_name):
     """Trigger an ElevenLabs outbound call. Returns (ok, payload)."""
-    first_line = task_brief.strip().split(".")[0][:160]
+    variables = call_variables(to_number, task_brief, contact_name)
+    missing = [k for k in REQUIRED_CALL_VARS
+               if not isinstance(variables.get(k), str) or not variables[k].strip()]
+    if missing:
+        # A missing dynamic variable crashes the call; never place one.
+        log.error("outbound call refused: missing dynamic variables %s", missing)
+        return False, {"error": "missing dynamic variables", "missing": missing}
     body = {
         "agent_id": OUTBOUND_AGENT_ID,
         "agent_phone_number_id": PHONE_NUMBER_ID,
         "to_number": to_number,
         "conversation_initiation_client_data": {
-            "dynamic_variables": {"task_brief": task_brief}
+            "dynamic_variables": variables
         },
         "conversation_config_override": {
             "agent": {
-                "first_message": (
-                    f"Hi, this is an AI assistant calling on behalf of Aaron Langley "
-                    f"regarding {contact_name} — {first_line}."
-                )
+                "first_message": opener(variables)
             }
         },
     }
@@ -171,7 +214,7 @@ def request_call():
     if denied:
         if denied[1] == 403:
             log_task({"event": "rejected", "reason": "caller_mismatch",
-                      "caller": caller})
+                      "caller": caller, "caller_type": caller_type(caller)})
         return denied
     if not to_number or not task_brief:
         return jsonify(ok=False, error="to_number and task_brief are required"), 400
@@ -179,7 +222,7 @@ def request_call():
         log.error("request-call refused: ElevenLabs config missing")
         return jsonify(ok=False, error="server missing ElevenLabs config"), 500
 
-    ok, payload = elevenlabs_outbound(to_number, task_brief, contact_name or "this matter")
+    ok, payload = elevenlabs_outbound(to_number, task_brief, contact_name)
     log_task({
         "event": "outbound_call",
         "ok": ok,
@@ -187,6 +230,8 @@ def request_call():
         "contact_name": contact_name,
         "task_brief": task_brief,
         "caller": caller,
+        "caller_type": caller_type(caller),
+        "callee_type": caller_type(to_number),
         "response": payload,
     })
     status = 200 if ok else 502
@@ -201,12 +246,14 @@ def relay_task():
     caller = (data.get("caller_number") or "").strip()
     task_text = (data.get("task") or "").strip()
     callback_note = (data.get("callback_note") or "").strip()
+    conversation_id = str(data.get("conversation_id") or "").strip() or None
+    ctype = caller_type(caller)
 
-    denied = check_caller(caller)
-    if denied:
-        return denied
+    # Relay is open to any caller; caller type is recorded, not enforced.
     if not task_text:
         return jsonify(ok=False, error="task is required"), 400
+    if conversation_id and conversation_id not in task_text:
+        task_text = f"[conv:{conversation_id}] {task_text}"
 
     now = datetime.now(timezone.utc)
     item_id = "inbox-" + now.strftime("%Y%m%d%H%M%S") + "-" + os.urandom(3).hex()
@@ -215,11 +262,14 @@ def relay_task():
         "task": task_text,
         "callback_note": callback_note,
         "caller": caller,
+        "caller_type": ctype,
+        "conversation_id": conversation_id,
         "received_at": now.isoformat(),
         "acked_at": None,
     }
     save_inbox(inbox_items)
     log_task({"event": "relay_task", "id": item_id, "caller": caller,
+              "caller_type": ctype, "conversation_id": conversation_id,
               "task": task_text[:200]})
     log.info("Relayed task %s to assistant inbox", item_id)
     return jsonify(ok=True, id=item_id)
@@ -264,8 +314,10 @@ def tasks():
 
 if __name__ == "__main__":
     log.info("config: ELEVENLABS_API_KEY=%s OUTBOUND_AGENT_ID=%s "
-             "PHONE_NUMBER_ID=%s AARON_CALLER_NUMBER=%s INBOX_TOKEN=%s",
+             "PHONE_NUMBER_ID=%s AARON_CALLER_NUMBER=%s "
+             "ROSALIE_CALLER_NUMBER=%s INBOX_TOKEN=%s",
              bool(EL_KEY), bool(OUTBOUND_AGENT_ID),
              bool(PHONE_NUMBER_ID), bool(AARON_CALLER_NUMBER),
+             bool(ROSALIE_CALLER_NUMBER),
              bool(INBOX_TOKEN))
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))

@@ -16,3 +16,5 @@ services:
         sync: false
       - key: AARON_CALLER_NUMBER
         value: "+17016091267"
+      - key: ROSALIE_CALLER_NUMBER
+        value: "+14805935327"
