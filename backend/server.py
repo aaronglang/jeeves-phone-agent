@@ -148,6 +148,8 @@ def opener(variables):
     """Jeeves identifies as Aaron's butler on every call."""
     if variables["callee_type"] == "aaron":
         return f"Jeeves here, Aaron. {variables['callback_topic']}."
+    if variables["callee_type"] == "rosalie":
+        return f"Jeeves here, Rosalie. {variables['callback_topic']}."
     return (f"I'm Jeeves — Aaron's butler. "
             f"I'm calling regarding {variables['callback_topic']}.")
 
